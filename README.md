@@ -11,3 +11,7 @@ Invoices are stored in a shared Supabase database: everyone on the team signs in
 ## Updating
 
 Everything lives in `index.html`. Edit it and push to `main`; GitHub Pages republishes within a minute or two.
+
+## Signing in
+
+Team members sign in with the email and password created for them in Supabase (Authentication > Users). Public sign-up is turned off.
