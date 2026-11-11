@@ -6,7 +6,7 @@ Live site: https://connectarvnd-oss.github.io/mlink-invoices/
 
 ## Where your data is kept
 
-On this site, invoices and company details are saved in the browser you use (localStorage). They do not sync between devices, and clearing site data removes them. Nothing is sent to a server.
+Invoices are stored in a shared Supabase database: everyone on the team signs in and sees the same invoices. See [SETUP.md](SETUP.md) to connect it. Until it is connected, the site falls back to saving invoices in the browser.
 
 ## Updating
 

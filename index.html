@@ -157,6 +157,9 @@ table.items { width: 100%; border-collapse: collapse; min-width: 460px; }
 /* settings dialog */
 .overlay { position: fixed; inset: 0; background: rgba(5,15,30,.45); z-index: 20; display: grid; place-items: center; padding: 16px; }
 .dialog { background: var(--surface); border-radius: 14px; width: min(720px, 100%); max-height: 90vh; overflow: auto; border: 1px solid var(--line); }
+.signin { width: min(380px, 100%); }
+.signin form { display: flex; flex-direction: column; gap: 12px; }
+.err { color: var(--bad); font-size: 13px; }
 .toast { position: fixed; bottom: calc(16px + env(safe-area-inset-bottom, 0px)); left: 50%; transform: translateX(-50%); background: var(--fg); color: var(--bg); padding: 8px 14px; border-radius: 8px; z-index: 30; font-size: 13px; }
 .note { font-size: 12px; color: var(--muted); }
 @media (prefers-reduced-motion: no-preference) { .row, .btn { transition: background .15s, border-color .15s; } }
@@ -169,6 +172,8 @@ table.items { width: 100%; border-collapse: collapse; min-width: 460px; }
       <div><h1>MLink Overseas</h1><small>Invoices</small></div>
     </div>
     <span class="sync" id="sync">Connecting…</span>
+    <span class="sync" id="who" hidden></span>
+    <button class="btn small" id="btnSignOut" type="button" hidden>Sign out</button>
     <button class="btn" id="btnSettings" type="button">Company details</button>
     <button class="btn primary" id="btnNew" type="button">+ New invoice</button>
   </div>
@@ -190,6 +195,15 @@ table.items { width: 100%; border-collapse: collapse; min-width: 460px; }
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
+<script>
+// Shared cloud (Supabase). Paste your project's values here; see SETUP.md.
+// The anon key is meant to be public: access is protected by sign-in and the database's row-level security.
+window.MLINK_CONFIG = {
+  SUPABASE_URL: "",
+  SUPABASE_ANON_KEY: "",
+};
+</script>
 <script>
 (() => {
 "use strict";
@@ -297,9 +311,15 @@ function toast(msg) {
 
 // ---------- storage: claude db when available, browser storage otherwise ----------
 const LS_KEY = "mlink-invoices-v1", LS_SET = "mlink-settings-v1";
+const CFG = window.MLINK_CONFIG || {};
+const sb = (CFG.SUPABASE_URL && CFG.SUPABASE_ANON_KEY && window.supabase)
+  ? window.supabase.createClient(CFG.SUPABASE_URL, CFG.SUPABASE_ANON_KEY) : null;
+
 const store = {
   db: null,
+  sb: null,
   async init() {
+    if (sb) return this.initSupabase();
     let db = null;
     if (window.claude && typeof window.claude.use === "function") {
       try { db = await Promise.race([window.claude.use("db"), new Promise(r => setTimeout(() => r(null), 10000))]); } catch { db = null; }
@@ -327,24 +347,84 @@ const store = {
       renderList(); renderWork();
     }
   },
+  async initSupabase() {
+    this.sb = sb; S.mode = "shared";
+    const { data: { session } } = await sb.auth.getSession();
+    sb.auth.onAuthStateChange((ev, sess) => {
+      if (ev === "SIGNED_OUT") { showSignIn(); S.invoices = {}; S.draft = null; S.currentId = null; renderList(); renderWork(); }
+    });
+    if (!session) { showSignIn(); setSync("Sign in to see invoices"); return; }
+    await this.startShared(session);
+  },
+  async startShared(session) {
+    $("#who").textContent = session.user.email; $("#who").hidden = false; $("#btnSignOut").hidden = false;
+    setSync("Loading invoices…");
+    const [inv, set] = await Promise.all([
+      sb.from("invoices").select("id,data"),
+      sb.from("settings").select("data").eq("id", "company").maybeSingle(),
+    ]);
+    if (inv.error) { setSync("Can't load invoices: " + inv.error.message); return; }
+    S.invoices = {}; inv.data.forEach(r => { S.invoices[r.id] = { ...r.data, id: r.id }; });
+    if (set.data?.data) S.settings = { ...DEFAULT_SETTINGS, ...set.data.data };
+    renderList(); renderWork(); renderPreview();
+    setSync("Shared with your team");
+    if (this.channel) sb.removeChannel(this.channel);
+    this.channel = sb.channel("mlink-live")
+      .on("postgres_changes", { event: "*", schema: "public", table: "invoices" }, (p) => {
+        if (p.eventType === "DELETE") { delete S.invoices[p.old.id]; if (S.currentId === p.old.id) { S.draft = null; S.currentId = null; renderWork(); } }
+        else {
+          S.invoices[p.new.id] = { ...p.new.data, id: p.new.id };
+          // refresh the open invoice only if this person isn't mid-edit
+          if (p.new.id === S.currentId && !saveTimerActive()) openInvoice(p.new.id);
+        }
+        renderList();
+      })
+      .on("postgres_changes", { event: "*", schema: "public", table: "settings" }, (p) => {
+        if (p.new?.data) { S.settings = { ...DEFAULT_SETTINGS, ...p.new.data }; renderList(); renderPreview(); }
+      })
+      .subscribe();
+  },
   async saveInvoice(inv) {
     S.invoices[inv.id] = inv;
-    if (this.db) { const { id, ...data } = inv; await this.db.collection("invoices").doc(id).set(data); }
+    if (this.sb) {
+      const { id, ...data } = inv;
+      const { error } = await this.sb.from("invoices").upsert({ id, data, updated_at: new Date().toISOString() });
+      if (error) throw error;
+    }
+    else if (this.db) { const { id, ...data } = inv; await this.db.collection("invoices").doc(id).set(data); }
     else this.flushLocal();
   },
   async deleteInvoice(id) {
     delete S.invoices[id];
-    if (this.db) await this.db.collection("invoices").doc(id).delete();
+    if (this.sb) { const { error } = await this.sb.from("invoices").delete().eq("id", id); if (error) throw error; }
+    else if (this.db) await this.db.collection("invoices").doc(id).delete();
     else this.flushLocal();
   },
   async saveSettings(s) {
     S.settings = s;
-    if (this.db) await this.db.doc("settings/company").set(s);
+    if (this.sb) { const { error } = await this.sb.from("settings").upsert({ id: "company", data: s }); if (error) throw error; }
+    else if (this.db) await this.db.doc("settings/company").set(s);
     else { try { localStorage.setItem(LS_SET, JSON.stringify(s)); } catch {} }
   },
   flushLocal() { try { localStorage.setItem(LS_KEY, JSON.stringify(S.invoices)); } catch {} },
 };
 function setSync(t) { $("#sync").textContent = t; }
+let saving = false;
+function saveTimerActive() { return saving; }
+
+function showSignIn(msg) {
+  $("#who").hidden = true; $("#btnSignOut").hidden = true;
+  $("#settingsHost").innerHTML = `<div class="overlay"><div class="dialog signin">
+    <div class="panel-head"><h2>Sign in to MLink Invoices</h2></div>
+    <div class="panel-body"><form id="signinForm">
+      <p class="note" style="margin:0">Use the email and password your admin set up for you in Supabase.</p>
+      <label class="f">Email<input id="si-email" type="email" autocomplete="username" required></label>
+      <label class="f">Password<input id="si-pass" type="password" autocomplete="current-password" required></label>
+      <div class="err" id="si-err">${esc(msg || "")}</div>
+      <button class="btn primary" type="submit">Sign in</button>
+    </form></div></div></div>`;
+  $("#si-email").focus();
+}
 
 // autosave the open draft
 let saveTimer = null;
@@ -352,10 +432,11 @@ function queueSave() {
   if (!S.draft) return;
   S.draft.updatedAt = Date.now();
   setSync("Saving…");
-  clearTimeout(saveTimer);
+  clearTimeout(saveTimer); saving = true;
   saveTimer = setTimeout(async () => {
+    saving = false;
     const copy = JSON.parse(JSON.stringify(S.draft));
-    try { await store.saveInvoice(copy); setSync(S.mode === "cloud" ? "All changes saved" : "Saved in this browser"); renderList(); }
+    try { await store.saveInvoice(copy); setSync(S.mode === "local" ? "Saved in this browser" : "All changes saved"); renderList(); }
     catch (e) { setSync("Couldn't save. Check your connection and edit again."); }
   }, 600);
 }
@@ -695,6 +776,7 @@ document.addEventListener("click", async (e) => {
     openInvoice(inv.id); setTimeout(() => $("#f-cname")?.focus(), 0); return;
   }
   if (t.id === "btnSettings") { openSettings(); return; }
+  if (t.id === "btnSignOut") { await sb?.auth.signOut(); return; }
   if (t.dataset.filter) { S.filter = t.dataset.filter; renderList(); return; }
   if (t.classList.contains("row")) { openInvoice(t.dataset.id); if (innerWidth < 860) $("#work").scrollIntoView({ behavior: "smooth" }); return; }
   if (!S.draft) return;
@@ -718,7 +800,7 @@ document.addEventListener("click", async (e) => {
     case "askdelete": S.confirmDelete = true; renderWork(); break;
     case "canceldelete": S.confirmDelete = false; renderWork(); break;
     case "delete": {
-      const id = d.id, num = d.number; clearTimeout(saveTimer);
+      const id = d.id, num = d.number; clearTimeout(saveTimer); saving = false;
       S.draft = null; S.currentId = null; S.confirmDelete = false;
       await store.deleteInvoice(id).catch(() => toast("Couldn't delete. Try again."));
       renderWork(); renderList(); toast("Deleted " + num); break;
@@ -748,6 +830,13 @@ document.addEventListener("input", (e) => {
 });
 
 document.addEventListener("submit", async (e) => {
+  if (e.target.id === "signinForm") {
+    e.preventDefault();
+    const btn = e.target.querySelector("button"); btn.disabled = true; btn.textContent = "Signing in…";
+    const { data, error } = await sb.auth.signInWithPassword({ email: $("#si-email").value.trim(), password: $("#si-pass").value });
+    if (error) { btn.disabled = false; btn.textContent = "Sign in"; $("#si-err").textContent = "Wrong email or password. Ask your admin if you need an account."; return; }
+    $("#settingsHost").innerHTML = ""; await store.startShared(data.session); return;
+  }
   if (e.target.id !== "setForm") return;
   e.preventDefault();
   const fd = new FormData(e.target), s = { ...S.settings };
